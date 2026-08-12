@@ -1,0 +1,506 @@
+//@version=6
+indicator("Confluence Channel + S/R + EMA20 + FVG", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs
+//──────────────────────────────────────────────────────────────────────────────
+string G_GENERAL  = "01. General"
+string G_SR       = "02. Support / Resistance"
+string G_ROUND    = "03. Round Numbers"
+string G_CHANNEL  = "04. Channels"
+string G_REJECT   = "05. Rejection & FVG"
+string G_ORDER    = "06. Virtual Trade"
+string G_TIME     = "07. Time Filter"
+string G_DASH     = "08. Dashboard & Display"
+
+showEma        = input.bool(true, "Show EMA 20", group = G_GENERAL)
+emaLength      = input.int(20, "EMA length", minval = 1, group = G_GENERAL)
+atrLength      = input.int(14, "ATR length", minval = 1, group = G_GENERAL)
+
+useSRConfirm   = input.bool(true, "Require historical S/R confluence", group = G_SR)
+showSR         = input.bool(true, "Show important S/R zones", group = G_SR)
+srPivotLength  = input.int(1, "S/R swing length (left/right bars)", minval = 1, maxval = 20, group = G_SR, tooltip = "1 means a 3-candle swing; 2 means a 5-candle swing.")
+minSRTouches   = input.int(3, "Minimum valid touches", minval = 2, maxval = 20, group = G_SR)
+srZoneAtr      = input.float(0.25, "Zone half-width (ATR multiplier)", minval = 0.01, step = 0.01, group = G_SR)
+srLookbackBars = input.int(500, "Zone visual lookback (bars)", minval = 50, maxval = 5000, group = G_SR)
+maxStoredZones = input.int(50, "Maximum stored zones per side", minval = 5, maxval = 100, group = G_SR)
+
+showRound          = input.bool(false, "Show round-number zones", group = G_ROUND)
+useRoundConfirm    = input.bool(false, "Require round-number confluence too", group = G_ROUND, tooltip = "When enabled, the rejection candle must also touch a round-number zone.")
+roundMode          = input.string("Auto", "Round-number step", options = ["Auto", "Manual"], group = G_ROUND)
+manualRoundStep    = input.float(10.0, "Manual round-number step", minval = 0.000001, step = 0.000001, group = G_ROUND)
+roundZoneAtr       = input.float(0.10, "Round-zone half-width (ATR multiplier)", minval = 0.0, step = 0.01, group = G_ROUND)
+roundLinesEachSide = input.int(8, "Visible round levels each side", minval = 1, maxval = 30, group = G_ROUND)
+
+showChannels       = input.bool(true, "Show active channel", group = G_CHANNEL)
+channelPivotLength = input.int(1, "Channel swing length (left/right bars)", minval = 1, maxval = 20, group = G_CHANNEL, tooltip = "1 means a 3-candle swing; 2 means a 5-candle swing.")
+minChannelTouches  = input.int(2, "Minimum traded-boundary touches", minval = 2, maxval = 10, group = G_CHANNEL, tooltip = "Counts the anchor swing and the FVG rejection candle. Default 2 means the setup is the second touch of the channel floor/ceiling.")
+channelTouchAtr    = input.float(0.15, "Channel touch tolerance (ATR multiplier)", minval = 0.0, step = 0.01, group = G_CHANNEL)
+minChannelWidthAtr = input.float(0.50, "Minimum channel width (ATR multiplier)", minval = 0.05, step = 0.05, group = G_CHANNEL)
+maxStoredPivots    = input.int(30, "Maximum channel pivots", minval = 5, maxval = 100, group = G_CHANNEL)
+
+useRejection     = input.bool(true, "Require rejection wick", group = G_REJECT)
+wickBodyPercent  = input.float(150.0, "Minimum wick as % of body", minval = 0.0, step = 5.0, group = G_REJECT, tooltip = "150 means the rejection wick must be at least 1.5 times the candle body.")
+dojiBodyPercent  = input.float(10.0, "Doji: maximum body as % of range", minval = 0.0, maxval = 100.0, step = 1.0, group = G_REJECT)
+showFVG          = input.bool(true, "Mark detected FVG signal candles", group = G_REJECT)
+
+targetRR         = input.float(1.5, "Target (R multiple)", minval = 0.1, maxval = 10.0, step = 0.1, group = G_ORDER)
+entryOffsetMode  = input.string("Ticks", "Entry offset unit", options = ["Ticks", "Pips"], group = G_ORDER)
+entryOffsetValue = input.float(0.0, "Entry offset", minval = 0.0, step = 0.1, group = G_ORDER)
+manualPipSize    = input.float(0.0, "Manual pip size (0 = automatic)", minval = 0.0, step = 0.00001, group = G_ORDER)
+stopBufferTicks  = input.float(0.0, "Stop buffer (ticks)", minval = 0.0, step = 1.0, group = G_ORDER)
+pendingBars      = input.int(3, "Limit order expiry (bars)", minval = 1, maxval = 100, group = G_ORDER)
+
+useTimeFilter = input.bool(false, "Enable time filter", group = G_TIME)
+timeZoneChoice = input.string("Tehran", "Time zone", options = ["Tehran", "New York"], group = G_TIME)
+signalSession  = input.session("0800-1700", "Permitted signal session", group = G_TIME)
+
+historyDays   = input.int(30, "Dashboard history (days)", minval = 1, maxval = 3650, group = G_DASH)
+showDashboard = input.bool(true, "Show dashboard", group = G_DASH)
+maxVisualTrades = input.int(100, "Maximum trade boxes kept", minval = 1, maxval = 150, group = G_DASH)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Base calculations and helpers
+//──────────────────────────────────────────────────────────────────────────────
+float atr = ta.atr(atrLength)
+float ema = ta.ema(close, emaLength)
+plot(showEma ? ema : na, "EMA", color = color.orange, linewidth = 2)
+
+string selectedTimeZone = timeZoneChoice == "Tehran" ? "Asia/Tehran" : "America/New_York"
+bool inAllowedSession = not useTimeFilter or not na(time(timeframe.period, signalSession, selectedTimeZone))
+
+f_autoRoundStep(float _price) =>
+    float absPrice = math.abs(_price)
+    float rawStep = absPrice > 0 ? math.pow(10.0, math.floor(math.log10(absPrice)) - 2) : syminfo.mintick
+    // Forex is usually read in hundredths, while indices and metals benefit from wider major levels.
+    syminfo.type == "forex" ? 0.01 : math.max(rawStep, syminfo.mintick)
+
+f_touchesLevel(float _low, float _high, float _level, float _halfWidth) =>
+    _low <= _level + _halfWidth and _high >= _level - _halfWidth
+
+f_roundTouched(float _low, float _high, float _step, float _halfWidth) =>
+    float lowerGrid = math.floor((_low - _halfWidth) / _step)
+    float upperGrid = math.ceil((_high + _halfWidth) / _step)
+    upperGrid >= lowerGrid
+
+f_arrayPushPivot(array<int> _bars, array<float> _prices, int _bar, float _price, int _limit) =>
+    array.unshift(_bars, _bar)
+    array.unshift(_prices, _price)
+    if array.size(_bars) > _limit
+        array.pop(_bars)
+        array.pop(_prices)
+
+f_addOrTouchZone(array<float> _prices, array<int> _touches, float _price, float _width, int _limit) =>
+    int matched = na
+    if array.size(_prices) > 0
+        for i = 0 to array.size(_prices) - 1
+            if math.abs(_price - array.get(_prices, i)) <= _width
+                matched := i
+                break
+    if na(matched)
+        array.unshift(_prices, _price)
+        array.unshift(_touches, 1)
+        if array.size(_prices) > _limit
+            array.pop(_prices)
+            array.pop(_touches)
+    else
+        float oldPrice = array.get(_prices, matched)
+        int oldTouches = array.get(_touches, matched)
+        // Averaging keeps clustered pivot prices centered rather than anchored to the first one.
+        array.set(_prices, matched, (oldPrice * oldTouches + _price) / (oldTouches + 1))
+        array.set(_touches, matched, oldTouches + 1)
+
+f_importantZoneTouched(float _low, float _high, array<float> _prices, array<int> _touches, int _minimumTouches, float _halfWidth) =>
+    bool touched = false
+    if array.size(_prices) > 0
+        for i = 0 to array.size(_prices) - 1
+            if array.get(_touches, i) >= _minimumTouches and f_touchesLevel(_low, _high, array.get(_prices, i), _halfWidth)
+                touched := true
+                break
+    touched
+
+f_recordTrade(float _resultR, int _closedAt, array<float> _results, array<int> _times) =>
+    array.push(_results, _resultR)
+    array.push(_times, _closedAt)
+    if array.size(_results) > 1000
+        array.shift(_results)
+        array.shift(_times)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Important historical support/resistance zones
+// Pivot lows create support; pivot highs create resistance.
+//──────────────────────────────────────────────────────────────────────────────
+var array<float> supportPrices = array.new_float()
+var array<int> supportTouches = array.new_int()
+var array<float> resistancePrices = array.new_float()
+var array<int> resistanceTouches = array.new_int()
+
+float srPH = ta.pivothigh(high, srPivotLength, srPivotLength)
+float srPL = ta.pivotlow(low, srPivotLength, srPivotLength)
+float srWidth = atr * srZoneAtr
+
+if not na(srPL)
+    f_addOrTouchZone(supportPrices, supportTouches, srPL, srWidth, maxStoredZones)
+if not na(srPH)
+    f_addOrTouchZone(resistancePrices, resistanceTouches, srPH, srWidth, maxStoredZones)
+
+// At the last bar, rebuild only the visible important-zone boxes. This avoids
+// accumulating one box per bar while keeping zones extended across the chart.
+var array<box> srBoxes = array.new_box()
+if barstate.islast
+    if array.size(srBoxes) > 0
+        for i = 0 to array.size(srBoxes) - 1
+            box.delete(array.get(srBoxes, i))
+    array.clear(srBoxes)
+    if showSR
+        int leftEdge = math.max(0, bar_index - srLookbackBars)
+        if array.size(supportPrices) > 0
+            for i = 0 to array.size(supportPrices) - 1
+                if array.get(supportTouches, i) >= minSRTouches
+                    float level = array.get(supportPrices, i)
+                    box bx = box.new(left = leftEdge, top = level + srWidth, right = bar_index + 1, bottom = level - srWidth, xloc = xloc.bar_index, bgcolor = color.new(color.lime, 88), border_color = color.new(color.lime, 35))
+                    array.push(srBoxes, bx)
+        if array.size(resistancePrices) > 0
+            for i = 0 to array.size(resistancePrices) - 1
+                if array.get(resistanceTouches, i) >= minSRTouches
+                    float level = array.get(resistancePrices, i)
+                    box bx = box.new(left = leftEdge, top = level + srWidth, right = bar_index + 1, bottom = level - srWidth, xloc = xloc.bar_index, bgcolor = color.new(color.red, 88), border_color = color.new(color.red, 35))
+                    array.push(srBoxes, bx)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Round-number levels
+//──────────────────────────────────────────────────────────────────────────────
+float roundStep = roundMode == "Manual" ? manualRoundStep : f_autoRoundStep(close)
+float roundHalfWidth = atr * roundZoneAtr
+var array<line> roundLines = array.new_line()
+if barstate.islast
+    if array.size(roundLines) > 0
+        for i = 0 to array.size(roundLines) - 1
+            line.delete(array.get(roundLines, i))
+    array.clear(roundLines)
+    if showRound
+        float centerRound = math.round(close / roundStep) * roundStep
+        int roundLeftEdge = math.max(0, bar_index - srLookbackBars)
+        for i = -roundLinesEachSide to roundLinesEachSide
+            float level = centerRound + i * roundStep
+            line roundLine = line.new(x1 = roundLeftEdge, y1 = level, x2 = bar_index + 1, y2 = level, xloc = xloc.bar_index, extend = extend.none, color = color.new(color.gray, 55), style = line.style_dotted)
+            array.push(roundLines, roundLine)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Channel detection
+// Up channel: two rising swing highs define the top, then it is shifted through
+// a swing low between them.  Down channel is the mirrored construction.
+// The setup candle is the next (second) touch of the traded channel boundary.
+//──────────────────────────────────────────────────────────────────────────────
+var array<int> channelHighBars = array.new_int()
+var array<float> channelHighPrices = array.new_float()
+var array<int> channelLowBars = array.new_int()
+var array<float> channelLowPrices = array.new_float()
+
+float chPH = ta.pivothigh(high, channelPivotLength, channelPivotLength)
+float chPL = ta.pivotlow(low, channelPivotLength, channelPivotLength)
+if not na(chPH)
+    f_arrayPushPivot(channelHighBars, channelHighPrices, bar_index - channelPivotLength, chPH, maxStoredPivots)
+if not na(chPL)
+    f_arrayPushPivot(channelLowBars, channelLowPrices, bar_index - channelPivotLength, chPL, maxStoredPivots)
+
+int channelDirection = 0
+float channelUpper = na
+float channelLower = na
+float channelSlope = na
+int channelStartBar = na
+
+// Ascending channel from the latest two confirmed swing highs and a low anchor.
+if array.size(channelHighBars) >= 2 and array.size(channelLowBars) > 0
+    int h1Bar = array.get(channelHighBars, 1)
+    int h2Bar = array.get(channelHighBars, 0)
+    float h1Price = array.get(channelHighPrices, 1)
+    float h2Price = array.get(channelHighPrices, 0)
+    float candidateSlope = (h2Price - h1Price) / (h2Bar - h1Bar)
+    if h2Price > h1Price
+        int bestLowBar = na
+        float bestLowPrice = na
+        float greatestGap = na
+        for i = 0 to array.size(channelLowBars) - 1
+            int lowBar = array.get(channelLowBars, i)
+            float lowPrice = array.get(channelLowPrices, i)
+            if lowBar > h1Bar and lowBar < h2Bar
+                float projectedTop = h1Price + candidateSlope * (lowBar - h1Bar)
+                float gap = projectedTop - lowPrice
+                if gap > 0 and (na(greatestGap) or gap > greatestGap)
+                    greatestGap := gap
+                    bestLowBar := lowBar
+                    bestLowPrice := lowPrice
+        if not na(bestLowBar) and greatestGap >= atr * minChannelWidthAtr
+            channelDirection := 1
+            channelSlope := candidateSlope
+            channelUpper := h1Price + candidateSlope * (bar_index - h1Bar)
+            channelLower := bestLowPrice + candidateSlope * (bar_index - bestLowBar)
+            channelStartBar := h1Bar
+
+// If no ascending channel is active, look for the mirrored descending channel.
+if channelDirection == 0 and array.size(channelLowBars) >= 2 and array.size(channelHighBars) > 0
+    int l1Bar = array.get(channelLowBars, 1)
+    int l2Bar = array.get(channelLowBars, 0)
+    float l1Price = array.get(channelLowPrices, 1)
+    float l2Price = array.get(channelLowPrices, 0)
+    float candidateSlope = (l2Price - l1Price) / (l2Bar - l1Bar)
+    if l2Price < l1Price
+        int bestHighBar = na
+        float bestHighPrice = na
+        float greatestGap = na
+        for i = 0 to array.size(channelHighBars) - 1
+            int highBar = array.get(channelHighBars, i)
+            float highPrice = array.get(channelHighPrices, i)
+            if highBar > l1Bar and highBar < l2Bar
+                float projectedBottom = l1Price + candidateSlope * (highBar - l1Bar)
+                float gap = highPrice - projectedBottom
+                if gap > 0 and (na(greatestGap) or gap > greatestGap)
+                    greatestGap := gap
+                    bestHighBar := highBar
+                    bestHighPrice := highPrice
+        if not na(bestHighBar) and greatestGap >= atr * minChannelWidthAtr
+            channelDirection := -1
+            channelSlope := candidateSlope
+            channelLower := l1Price + candidateSlope * (bar_index - l1Bar)
+            channelUpper := bestHighPrice + candidateSlope * (bar_index - bestHighBar)
+            channelStartBar := l1Bar
+
+// Count confirmed contacts already lying on the boundary being traded.  The
+// rejection candle is added separately below, because it is not necessarily a
+// confirmed swing at the moment its FVG completes.
+int channelBoundaryTouches = 0
+if channelDirection == 1
+    for i = 0 to array.size(channelLowBars) - 1
+        int touchBar = array.get(channelLowBars, i)
+        float touchPrice = array.get(channelLowPrices, i)
+        float projectedBoundary = channelLower - channelSlope * (bar_index - touchBar)
+        if touchBar >= channelStartBar and math.abs(touchPrice - projectedBoundary) <= atr * channelTouchAtr
+            channelBoundaryTouches += 1
+else if channelDirection == -1
+    for i = 0 to array.size(channelHighBars) - 1
+        int touchBar = array.get(channelHighBars, i)
+        float touchPrice = array.get(channelHighPrices, i)
+        float projectedBoundary = channelUpper - channelSlope * (bar_index - touchBar)
+        if touchBar >= channelStartBar and math.abs(touchPrice - projectedBoundary) <= atr * channelTouchAtr
+            channelBoundaryTouches += 1
+
+var line activeChannelUpper = na
+var line activeChannelLower = na
+if barstate.islast
+    if not na(activeChannelUpper)
+        line.delete(activeChannelUpper)
+    if not na(activeChannelLower)
+        line.delete(activeChannelLower)
+    if showChannels and channelDirection != 0
+        color channelColor = channelDirection == 1 ? color.aqua : color.fuchsia
+        float upperAtStart = channelUpper - channelSlope * (bar_index - channelStartBar)
+        float lowerAtStart = channelLower - channelSlope * (bar_index - channelStartBar)
+        activeChannelUpper := line.new(x1 = channelStartBar, y1 = upperAtStart, x2 = bar_index + 1, y2 = channelUpper + channelSlope, xloc = xloc.bar_index, color = channelColor, width = 2)
+        activeChannelLower := line.new(x1 = channelStartBar, y1 = lowerAtStart, x2 = bar_index + 1, y2 = channelLower + channelSlope, xloc = xloc.bar_index, color = channelColor, width = 2)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Set-up confirmation on the first FVG candle (two bars ago)
+//──────────────────────────────────────────────────────────────────────────────
+float candleRange = high[2] - low[2]
+float candleBody = math.abs(close[2] - open[2])
+float lowerWick = math.min(open[2], close[2]) - low[2]
+float upperWick = high[2] - math.max(open[2], close[2])
+bool isDoji = candleRange > 0 and candleBody <= candleRange * dojiBodyPercent / 100.0
+bool bullishRejection = isDoji ? lowerWick > 0 : lowerWick >= candleBody * wickBodyPercent / 100.0
+bool bearishRejection = isDoji ? upperWick > 0 : upperWick >= candleBody * wickBodyPercent / 100.0
+
+float sourceZoneWidth = atr[2] * srZoneAtr
+bool supportTouched = f_importantZoneTouched(low[2], high[2], supportPrices, supportTouches, minSRTouches, sourceZoneWidth)
+bool resistanceTouched = f_importantZoneTouched(low[2], high[2], resistancePrices, resistanceTouches, minSRTouches, sourceZoneWidth)
+bool roundTouched = f_roundTouched(low[2], high[2], roundStep[2], atr[2] * roundZoneAtr)
+bool emaTouched = f_touchesLevel(low[2], high[2], ema[2], atr[2] * channelTouchAtr)
+bool lowerChannelTouched = channelDirection[2] == 1 and f_touchesLevel(low[2], high[2], channelLower[2], atr[2] * channelTouchAtr)
+bool upperChannelTouched = channelDirection[2] == -1 and f_touchesLevel(low[2], high[2], channelUpper[2], atr[2] * channelTouchAtr)
+bool enoughLowerTouches = channelBoundaryTouches[2] + 1 >= minChannelTouches
+bool enoughUpperTouches = channelBoundaryTouches[2] + 1 >= minChannelTouches
+
+bool bullishFVG = bar_index >= 2 and low > high[2]
+bool bearishFVG = bar_index >= 2 and high < low[2]
+bool buyConfluence = lowerChannelTouched and enoughLowerTouches and emaTouched and (not useSRConfirm or supportTouched) and (not useRoundConfirm or roundTouched) and (not useRejection or bullishRejection)
+bool sellConfluence = upperChannelTouched and enoughUpperTouches and emaTouched and (not useSRConfirm or resistanceTouched) and (not useRoundConfirm or roundTouched) and (not useRejection or bearishRejection)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Virtual limit-order and trade simulation
+// A new signal is accepted only when no previous virtual order/trade is active.
+// For an ambiguous historical TP/SL bar, SL always wins (conservative rule).
+//──────────────────────────────────────────────────────────────────────────────
+float autoPipSize = syminfo.type == "forex" ? syminfo.mintick * 10.0 : syminfo.mintick
+float offsetSize = entryOffsetMode == "Ticks" ? entryOffsetValue * syminfo.mintick : entryOffsetValue * (manualPipSize > 0 ? manualPipSize : autoPipSize)
+float stopBuffer = stopBufferTicks * syminfo.mintick
+
+var int pendingDirection = 0
+var float pendingEntry = na
+var float pendingStop = na
+var float pendingTarget = na
+var int pendingSignalBar = na
+var int openDirection = 0
+var float openEntry = na
+var float openStop = na
+var float openTarget = na
+var box activeStopBox = na
+var box activeTargetBox = na
+var array<box> tradeStopBoxes = array.new_box()
+var array<box> tradeTargetBoxes = array.new_box()
+var array<float> closedResults = array.new_float()
+var array<int> closedTimes = array.new_int()
+
+// Pending-order management starts only on bars after the signal is created.
+if pendingDirection != 0
+    bool expired = bar_index - pendingSignalBar > pendingBars
+    if expired
+        pendingDirection := 0
+        pendingEntry := na
+        pendingStop := na
+        pendingTarget := na
+        pendingSignalBar := na
+    else
+        bool entryTouched = pendingDirection == 1 ? low <= pendingEntry : high >= pendingEntry
+        bool targetBeforeEntry = pendingDirection == 1 ? (high >= pendingTarget and not entryTouched) : (low <= pendingTarget and not entryTouched)
+        if targetBeforeEntry
+            // Price reached the planned target without pulling back to the limit entry.
+            pendingDirection := 0
+            pendingEntry := na
+            pendingStop := na
+            pendingTarget := na
+            pendingSignalBar := na
+        else if entryTouched
+            openDirection := pendingDirection
+            openEntry := pendingEntry
+            openStop := pendingStop
+            openTarget := pendingTarget
+            activeStopBox := box.new(left = bar_index, top = openEntry, right = bar_index + 1, bottom = openStop, xloc = xloc.bar_index, bgcolor = color.new(color.red, 78), border_color = color.new(color.red, 15))
+            activeTargetBox := box.new(left = bar_index, top = openTarget, right = bar_index + 1, bottom = openEntry, xloc = xloc.bar_index, bgcolor = color.new(color.lime, 78), border_color = color.new(color.lime, 15))
+            array.push(tradeStopBoxes, activeStopBox)
+            array.push(tradeTargetBoxes, activeTargetBox)
+            if array.size(tradeStopBoxes) > maxVisualTrades
+                box.delete(array.shift(tradeStopBoxes))
+                box.delete(array.shift(tradeTargetBoxes))
+            pendingDirection := 0
+            pendingEntry := na
+            pendingStop := na
+            pendingTarget := na
+            pendingSignalBar := na
+
+// Active trade management.  Stop is evaluated first when both boundaries trade
+// inside the same historical candle.
+if openDirection != 0
+    if not na(activeStopBox)
+        box.set_right(activeStopBox, bar_index + 1)
+    if not na(activeTargetBox)
+        box.set_right(activeTargetBox, bar_index + 1)
+    bool stopHit = openDirection == 1 ? low <= openStop : high >= openStop
+    bool targetHit = openDirection == 1 ? high >= openTarget : low <= openTarget
+    if stopHit or targetHit
+        bool won = not stopHit and targetHit
+        f_recordTrade(won ? targetRR : -1.0, time_close, closedResults, closedTimes)
+        if not na(activeStopBox)
+            box.set_right(activeStopBox, bar_index + 1)
+        if not na(activeTargetBox)
+            box.set_right(activeTargetBox, bar_index + 1)
+        label.new(bar_index, won ? openTarget : openStop, won ? "TP  +" + str.tostring(targetRR, "#.##") + "R" : "SL  -1R", style = won ? label.style_label_down : label.style_label_up, color = won ? color.lime : color.red, textcolor = color.white, size = size.tiny)
+        openDirection := 0
+        openEntry := na
+        openStop := na
+        openTarget := na
+        activeStopBox := na
+        activeTargetBox := na
+
+bool readyForSignal = pendingDirection == 0 and openDirection == 0
+bool buySignal = readyForSignal and inAllowedSession and bullishFVG and buyConfluence
+bool sellSignal = readyForSignal and inAllowedSession and bearishFVG and sellConfluence
+
+if buySignal
+    float proposedEntry = low - offsetSize
+    float proposedStop = low[2] - stopBuffer
+    float risk = proposedEntry - proposedStop
+    if risk > syminfo.mintick
+        pendingDirection := 1
+        pendingEntry := proposedEntry
+        pendingStop := proposedStop
+        pendingTarget := proposedEntry + risk * targetRR
+        pendingSignalBar := bar_index
+
+if sellSignal
+    float proposedEntry = high + offsetSize
+    float proposedStop = high[2] + stopBuffer
+    float risk = proposedStop - proposedEntry
+    if risk > syminfo.mintick
+        pendingDirection := -1
+        pendingEntry := proposedEntry
+        pendingStop := proposedStop
+        pendingTarget := proposedEntry - risk * targetRR
+        pendingSignalBar := bar_index
+
+plotshape(showFVG and buySignal, title = "Buy FVG setup", style = shape.labelup, location = location.belowbar, color = color.lime, text = "BUY\nFVG", textcolor = color.black, size = size.tiny)
+plotshape(showFVG and sellSignal, title = "Sell FVG setup", style = shape.labeldown, location = location.abovebar, color = color.red, text = "SELL\nFVG", textcolor = color.white, size = size.tiny)
+
+alertcondition(buySignal, "Buy confluence FVG", "Buy setup: channel + S/R + EMA20 + rejection + bullish FVG")
+alertcondition(sellSignal, "Sell confluence FVG", "Sell setup: channel + S/R + EMA20 + rejection + bearish FVG")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Dashboard: completed virtual trades whose close time is within the requested
+// history window.  Max streaks are calculated within that same filtered window.
+//──────────────────────────────────────────────────────────────────────────────
+var table dashboard = table.new(position.top_right, 2, 10, border_width = 1)
+if barstate.islast and showDashboard
+    int referenceTime = time_close
+    int windowStart = referenceTime - historyDays * 24 * 60 * 60 * 1000
+    int totalTrades = 0
+    int wins = 0
+    int losses = 0
+    float netR = 0.0
+    int runningWins = 0
+    int runningLosses = 0
+    int maxWins = 0
+    int maxLosses = 0
+    int currentStreak = 0
+    if array.size(closedResults) > 0
+        for i = 0 to array.size(closedResults) - 1
+            float result = array.get(closedResults, i)
+            int closedAt = array.get(closedTimes, i)
+            if closedAt >= windowStart
+                totalTrades += 1
+                netR += result
+                if result > 0
+                    wins += 1
+                    runningWins += 1
+                    runningLosses := 0
+                    maxWins := math.max(maxWins, runningWins)
+                    currentStreak := runningWins
+                else
+                    losses += 1
+                    runningLosses += 1
+                    runningWins := 0
+                    maxLosses := math.max(maxLosses, runningLosses)
+                    currentStreak := -runningLosses
+    float winRate = totalTrades > 0 ? wins * 100.0 / totalTrades : na
+    table.clear(dashboard, 0, 0, 1, 9)
+    table.cell(dashboard, 0, 0, "Confluence FVG", text_color = color.white, bgcolor = color.rgb(25, 25, 35))
+    table.cell(dashboard, 1, 0, str.tostring(historyDays) + " day(s)", text_color = color.white, bgcolor = color.rgb(25, 25, 35))
+    table.cell(dashboard, 0, 1, "Closed trades")
+    table.cell(dashboard, 1, 1, str.tostring(totalTrades))
+    table.cell(dashboard, 0, 2, "Wins / Losses")
+    table.cell(dashboard, 1, 2, str.tostring(wins) + " / " + str.tostring(losses), text_color = wins >= losses ? color.lime : color.red)
+    table.cell(dashboard, 0, 3, "Win rate")
+    table.cell(dashboard, 1, 3, na(winRate) ? "—" : str.tostring(winRate, "#.##") + "%")
+    table.cell(dashboard, 0, 4, "Net result")
+    table.cell(dashboard, 1, 4, str.tostring(netR, "#.##") + "R", text_color = netR >= 0 ? color.lime : color.red)
+    table.cell(dashboard, 0, 5, "Max win streak")
+    table.cell(dashboard, 1, 5, str.tostring(maxWins), text_color = color.lime)
+    table.cell(dashboard, 0, 6, "Max loss streak")
+    table.cell(dashboard, 1, 6, str.tostring(maxLosses), text_color = color.red)
+    table.cell(dashboard, 0, 7, "Current streak")
+    table.cell(dashboard, 1, 7, currentStreak > 0 ? "W" + str.tostring(currentStreak) : currentStreak < 0 ? "L" + str.tostring(-currentStreak) : "—", text_color = currentStreak >= 0 ? color.lime : color.red)
+    table.cell(dashboard, 0, 8, "Order / trade")
+    string status = pendingDirection != 0 ? (pendingDirection == 1 ? "Buy limit pending" : "Sell limit pending") : openDirection != 0 ? (openDirection == 1 ? "Buy active" : "Sell active") : "None"
+    table.cell(dashboard, 1, 8, status)
+    table.cell(dashboard, 0, 9, "Session")
+    table.cell(dashboard, 1, 9, useTimeFilter ? timeZoneChoice + " " + signalSession : "Off")
+else if barstate.islast and not showDashboard
+    table.clear(dashboard, 0, 0, 1, 9)
