@@ -97,18 +97,23 @@ f_addOrTouchZone(array<float> _prices, array<int> _touches, float _price, float 
             if math.abs(_price - array.get(_prices, i)) <= _width
                 matched := i
                 break
+    // Both branches must yield the same type, because the if/else is the return
+    // value of the function.  Returning whether a brand new zone was created
+    // keeps the two blocks compatible and is useful information for callers.
     if na(matched)
         array.unshift(_prices, _price)
         array.unshift(_touches, 1)
         if array.size(_prices) > _limit
             array.pop(_prices)
             array.pop(_touches)
+        true
     else
         float oldPrice = array.get(_prices, matched)
         int oldTouches = array.get(_touches, matched)
         // Averaging keeps clustered pivot prices centered rather than anchored to the first one.
         array.set(_prices, matched, (oldPrice * oldTouches + _price) / (oldTouches + 1))
         array.set(_touches, matched, oldTouches + 1)
+        false
 
 f_importantZoneTouched(float _low, float _high, array<float> _prices, array<int> _touches, int _minimumTouches, float _halfWidth) =>
     bool touched = false
